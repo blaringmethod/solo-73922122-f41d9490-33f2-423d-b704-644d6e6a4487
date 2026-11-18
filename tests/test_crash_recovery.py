@@ -92,10 +92,14 @@ async def test_crashed_worker_is_taken_over_by_survivor(tmp_path):
     assert states[0]["ref_batch_ids"] == []
 
     # The lock must be releasable by another session (proves no stuck lock).
-    lock_rows = await _sql(
-        "SELECT pg_try_advisory_lock(78219001, hashtext('EQ-K')) AS got")
+    # Probe the exact key the worker uses: the device's stable lock_key
+    # composed with the worker namespace (see app.worker.advisory_lock_key).
+    from app.worker import advisory_lock_key
+    rows = await _sql("SELECT lock_key FROM device_state WHERE device_id='EQ-K'")
+    key = advisory_lock_key(rows[0]["lock_key"])
+    lock_rows = await _sql(f"SELECT pg_try_advisory_lock({key}) AS got")
     assert lock_rows[0]["got"] is True
-    await _sql("SELECT pg_advisory_unlock(78219001, hashtext('EQ-K'))")
+    await _sql(f"SELECT pg_advisory_unlock({key})")
 
     # Survivor instance takes over and drains the queue.
     rc, out, err = await _run_harness(

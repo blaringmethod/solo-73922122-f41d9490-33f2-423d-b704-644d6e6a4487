@@ -113,6 +113,80 @@ async def test_slow_head_batch_blocks_same_device_only(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hash_colliding_devices_progress_independently(
+        tmp_path, monkeypatch):
+    """Regression: DEV-29784 and DEV-140889 collide under 32-bit hashtext().
+
+    Keying the per-device advisory lock on that hash made the two devices
+    share one lock, so a slow batch on DEV-29784 stalled DEV-140889 even
+    with an idle second instance.  The lock key now comes from the device's
+    unique device_state.lock_key, so distinct devices never share a lock.
+    """
+    slow_file = tmp_path / "slow.txt"
+    monkeypatch.setattr(settings, "slow_marker_file", str(slow_file))
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE wafer_measurements, batches, device_state")
+            await conn.execute("ALTER SEQUENCE batches_id_seq RESTART WITH 1")
+
+        slow_id = await _submit(pool, "SLOW-1", "DEV-29784", 500)
+        other1 = await _submit(pool, "OTHER-1", "DEV-140889", 700)
+        other2 = await _submit(pool, "OTHER-2", "DEV-140889", 700)
+
+        async with pool.acquire() as conn:
+            # The premise: these two device ids really do collide in the
+            # 32-bit hashtext() space the lock used to be derived from...
+            assert await conn.fetchval(
+                "SELECT hashtext('DEV-29784') = hashtext('DEV-140889')")
+            # ...while their stable lock keys are distinct.
+            keys = await conn.fetch(
+                "SELECT device_id, lock_key FROM device_state ORDER BY device_id")
+            assert len({r["lock_key"] for r in keys}) == 2
+
+        # 5-second artificial delay on the DEV-29784 head batch only.
+        slow_file.write_text(f"{slow_id}:5\n")
+
+        w1 = DecisionWorker(pool, "w1")
+        w2 = DecisionWorker(pool, "w2")
+        w1.start(); w2.start()
+        try:
+            # While DEV-29784's batch is still being processed, DEV-140889
+            # must be decided by the other worker.
+            done = False
+            deadline = time.time() + 4.0  # must finish well inside the 5s sleep
+            while time.time() < deadline:
+                async with pool.acquire() as conn:
+                    slow_status = await conn.fetchval(
+                        "SELECT status FROM batches WHERE id=$1", slow_id)
+                    o1_status = await conn.fetchval(
+                        "SELECT status FROM batches WHERE id=$1", other1)
+                    o2_status = await conn.fetchval(
+                        "SELECT status FROM batches WHERE id=$1", other2)
+                if (slow_status == "PENDING"
+                        and o1_status == o2_status == "RELEASED"):
+                    done = True
+                    break
+                await asyncio.sleep(0.1)
+            assert done, "hash-colliding device was blocked by the slow batch"
+
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                async with pool.acquire() as conn:
+                    pending = await conn.fetchval(
+                        "SELECT count(*) FROM batches WHERE status='PENDING'")
+                if pending == 0:
+                    break
+                await asyncio.sleep(0.2)
+            assert pending == 0
+        finally:
+            await w1.stop(); await w2.stop()
+    finally:
+        await close_pool()
+
+
+@pytest.mark.asyncio
 async def test_two_workers_never_double_decide(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "slow_marker_file",
                         str(tmp_path / "slow.txt"))

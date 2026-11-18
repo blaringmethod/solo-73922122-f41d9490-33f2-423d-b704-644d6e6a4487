@@ -3,12 +3,20 @@
 Concurrency model (two API instances each run one worker)
 ---------------------------------------------------------
 * Each device is serialised by a *session-level* PostgreSQL advisory lock
-  (``pg_try_advisory_lock`` keyed by the device).  A worker that cannot get
-  the lock simply moves on to another device, so:
+  (``pg_try_advisory_lock`` keyed by the device's ``device_state.lock_key``
+  -- a unique, database-generated bigint per device).  A worker that cannot
+  get the lock simply moves on to another device, so:
     - a slow batch blocks later batches **of the same device** (head-of-line
       ordering is enforced by always picking the smallest ``accept_seq``);
     - it never blocks other devices, uploads or queries;
     - two workers never decide the same batch.
+
+  The lock key must NOT be a 32-bit hash of the device id: ``hashtext``
+  collides (e.g. ``hashtext('DEV-29784') = hashtext('DEV-140889')``), and a
+  collision silently couples two unrelated devices -- a slow batch on one
+  would stall the other even with an idle instance.  The identity column
+  gives every registered device a distinct key by construction, and new
+  devices get theirs from the intake transaction that registers them.
 * The decision itself is one transaction: row locks on ``device_state`` and
   the batch, median/drift calculation, decision write, and -- for released
   batches only -- appending to ``ref_batch_ids``.  Either everything becomes
@@ -16,14 +24,15 @@ Concurrency model (two API instances each run one worker)
   advancement of the reference window.
 * If a process dies mid-batch (before COMMIT), the row stays ``PENDING`` and
   ``device_state`` is untouched; the surviving instance's next poll picks it
-  up and finishes it.
+  up and finishes it.  Advisory locks held by the dead session are released
+  by PostgreSQL itself.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-from typing import Dict, List, Optional, Set
+from typing import Dict, Optional, Set
 
 import asyncpg
 
@@ -33,9 +42,25 @@ from .csvutil import median_nm
 log = logging.getLogger("fab.worker")
 
 
-def _read_marker_file(path: str) -> Dict[int, float]:
-    """Parse ``batch_id`` or ``batch_id:seconds`` lines; missing file => {}."""
-    out: Dict[int, float] = {}
+def advisory_lock_key(device_lock_key: int) -> int:
+    """Compose the session advisory-lock key for a device.
+
+    ``device_lock_key`` is the device's unique ``device_state.lock_key``; the
+    configured ``worker_lock_id`` namespaces the key so this application's
+    locks never collide with another client's on a shared database.  The
+    result fits a signed bigint for any realistic id space.
+    """
+    return (settings.worker_lock_id << 32) | (device_lock_key & 0xFFFFFFFF)
+
+
+def _read_marker_file(path: str) -> Dict[str, float]:
+    """Parse ``key`` or ``key:seconds`` lines; missing file => {}.
+
+    A key matches a batch when it equals either its numeric id or its
+    ``batch_no`` -- batch numbers make the demos deterministic because they
+    are known before the batch is submitted.
+    """
+    out: Dict[str, float] = {}
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -43,10 +68,10 @@ def _read_marker_file(path: str) -> Dict[int, float]:
                 if not line or line.startswith("#"):
                     continue
                 if ":" in line:
-                    bid, _, secs = line.partition(":")
-                    out[int(bid.strip())] = float(secs.strip())
+                    key, _, secs = line.partition(":")
+                    out[key.strip()] = float(secs.strip())
                 else:
-                    out[int(line)] = 8.0
+                    out[line] = 8.0
     except FileNotFoundError:
         return {}
     except ValueError as exc:
@@ -128,17 +153,22 @@ class DecisionWorker:
 
     async def _tick(self, conn: asyncpg.Connection) -> bool:
         """One sweep over devices that still have pending batches."""
+        # Join device_state (guaranteed to exist: intake registers the device
+        # in the same transaction as the batch) to get the stable lock key.
         devices = await conn.fetch(
-            "SELECT DISTINCT device_id FROM batches WHERE status = 'PENDING'"
+            "SELECT DISTINCT b.device_id, ds.lock_key "
+            "FROM batches b "
+            "JOIN device_state ds ON ds.device_id = b.device_id "
+            "WHERE b.status = 'PENDING'"
         )
         did_work = False
         for dev_row in devices:
             if self._stop.is_set():
                 break
             device_id = dev_row["device_id"]
+            lock_key = advisory_lock_key(dev_row["lock_key"])
             got = await conn.fetchval(
-                "SELECT pg_try_advisory_lock($1, hashtext($2))",
-                settings.worker_lock_id, device_id,
+                "SELECT pg_try_advisory_lock($1)", lock_key,
             )
             if not got:
                 # Another instance owns this device right now.
@@ -153,10 +183,7 @@ class DecisionWorker:
                     await self._process_batch(conn, head)
                     did_work = True
             finally:
-                await conn.execute(
-                    "SELECT pg_advisory_unlock($1, hashtext($2))",
-                    settings.worker_lock_id, device_id,
-                )
+                await conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
         return did_work
 
     # ------------------------------------------------------------- one batch
@@ -175,13 +202,16 @@ class DecisionWorker:
         )
 
         # Demo hooks (marker files managed by the demonstration scripts).
+        # A marker key matches either the numeric batch id or the batch_no.
+        keys = (str(batch_id), head["batch_no"])
         slow = _read_marker_file(settings.slow_marker_file)
-        if batch_id in slow:
+        delay = next((slow[k] for k in keys if k in slow), None)
+        if delay is not None:
             log.info("[%s] SLOW batch id=%d sleeping %.1fs while holding device lock",
-                     self._instance_id, batch_id, slow[batch_id])
-            await asyncio.sleep(slow[batch_id])
+                     self._instance_id, batch_id, delay)
+            await asyncio.sleep(delay)
         crashes = self._crash_ids()
-        if batch_id in crashes:
+        if any(k in crashes for k in keys):
             log.error("[%s] CRASH demo: exiting before decision of batch id=%d "
                       "(row stays PENDING, survivor will take over)",
                       self._instance_id, batch_id)
@@ -190,17 +220,15 @@ class DecisionWorker:
 
         await self._decide(conn, head)
 
-    def _crash_ids(self) -> Set[int]:
-        out: Set[int] = set()
+    def _crash_ids(self) -> Set[str]:
+        out: Set[str] = set()
         try:
             with open(settings.crash_marker_file, "r", encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if line and not line.startswith("#"):
-                        out.add(int(line.partition(":")[0].strip()))
+                        out.add(line.partition(":")[0].strip())
         except FileNotFoundError:
-            return set()
-        except ValueError:
             return set()
         return out
 

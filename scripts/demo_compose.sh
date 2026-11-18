@@ -65,38 +65,44 @@ echo; echo "== 4. slow head-of-line batch on $DEV-SLOW (other device flows) =="
 SLOWDEV="${DEV}-SLOW"; OTHERDEV="${DEV}-OTHER"
 csv S1 500 5 > /tmp/s1.csv; csv S2 500 5 > /tmp/s2.csv
 csv O1 700 5 > /tmp/o1.csv; csv O2 700 5 > /tmp/o2.csv
-S1ID=$(post SLOW-1 "$SLOWDEV" /tmp/s1.csv | sed -n '1p' | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+# Mark SLOW-1 slow by batch number BEFORE uploading it, so the marker is in
+# place before any worker can pick the batch up (deterministic).
+docker compose exec -T api1 sh -c "echo 'SLOW-1:8' > /data/raw/slow_batches.txt"
+post SLOW-1 "$SLOWDEV" /tmp/s1.csv >/dev/null
+# Uploads stay available while SLOW-1 is being processed.
 post SLOW-2 "$SLOWDEV" /tmp/s2.csv >/dev/null
-# Mark the head batch slow inside the shared raw volume (both containers see it).
-docker compose exec -T api1 sh -c "echo '$S1ID:8' > /data/raw/slow_batches.txt"
 post OTHER-1 "$OTHERDEV" /tmp/o1.csv >/dev/null
 post OTHER-2 "$OTHERDEV" /tmp/o2.csv >/dev/null
 sleep 2
 echo "  while SLOW-1 pending: SLOW-1=$(status_of SLOW-1), OTHER-2=$(status_of OTHER-2)"
+[ "$(status_of SLOW-1)" = "PENDING" ] && [ "$(status_of OTHER-2)" = "RELEASED" ] \
+  || { echo "FAIL: slow head batch blocked the other device"; exit 1; }
 echo "  SLOW-1 -> $(wait_decided SLOW-1), SLOW-2 -> $(wait_decided SLOW-2)"
 docker compose exec -T api1 sh -c 'rm -f /data/raw/slow_batches.txt'
 
 echo; echo "== 5. container crash mid-batch and survivor takeover =="
 CDEV="${DEV}-CRASH"
-# Ingest four batches first while both instances are up; the crash marker is
-# only written afterwards so ingestion itself never crashes.
-for n in 1 2 3 4; do csv "C$n" $([ "$n" = 4 ] && echo 504 || echo 500) 5 > "/tmp/c$n.csv"; done
-C1ID=$(post CRASH-1 "$CDEV" /tmp/c1.csv | sed -n '1p' | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
-post CRASH-2 "$CDEV" /tmp/c2.csv >/dev/null
-post CRASH-3 "$CDEV" /tmp/c3.csv >/dev/null
-post CRASH-4 "$CDEV" /tmp/c4.csv >/dev/null
+# Ingest four batches with NO worker running (both APIs stopped, a workerless
+# one-shot harness submits), so the crash is guaranteed to hit a PENDING
+# batch.  The crash marker is written by the same harness, keyed by the
+# batch number CRASH-1.
+docker compose stop api1 api2
+docker compose run --rm -T -e INSTANCE_ID=ingest api1 \
+  python -m scripts.worker_harness --no-worker --crash CRASH-1 \
+  --submit "CRASH-1:$CDEV:500:5,CRASH-2:$CDEV:500:5,CRASH-3:$CDEV:500:5,CRASH-4:$CDEV:504:5"
 
-# Stop api1, then make a dedicated one-shot worker hard-exit while holding
-# CRASH-1 (same effect as kill -9 of a container). api2 is the survivor.
-docker compose stop api1
-docker compose exec -T api2 sh -c "echo '$C1ID' > /data/raw/crash_batches.txt"
-docker compose run --rm \
-  -e INSTANCE_ID=crasher \
-  api1 python -m scripts.worker_harness --instance-id crasher --crash "$C1ID" || true
-echo "  row after crash (must stay PENDING, no median):"
-curl -sS "$BASE/batches/CRASH-1" | j | grep -E 'status|median|attempts'
-docker compose exec -T api2 sh -c 'rm -f /data/raw/crash_batches.txt'
-docker compose start api1
+# A dedicated one-shot worker hard-exits (os._exit, like kill -9) while
+# deciding CRASH-1; the APIs stay down so nothing else interferes.
+docker compose run --rm -T -e INSTANCE_ID=crasher api1 \
+  python -m scripts.worker_harness --exit-when-idle --idle-timeout 30 || true
+echo "  rows after crash (CRASH-1 must stay PENDING, no median):"
+docker compose exec -T db psql -U "${POSTGRES_USER:-fab}" -d "${POSTGRES_DB:-fab}" -c \
+  "SELECT batch_no, status, median_nm, attempts FROM batches WHERE device_id='$CDEV' ORDER BY accept_seq"
+
+# Remove the crash marker BEFORE the APIs come back, then let the surviving
+# instances drain the queue.
+docker compose run --rm -T api1 sh -c 'rm -f /data/raw/crash_batches.txt'
+docker compose start api1 api2
 for b in CRASH-1 CRASH-2 CRASH-3 CRASH-4; do echo "  $b -> $(wait_decided "$b")"; done
 echo "  final decision + references for the post-baseline batch CRASH-4:"
 curl -sS "$BASE/batches/CRASH-4" | j

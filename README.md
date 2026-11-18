@@ -22,6 +22,7 @@
 | 同批号同设备同原件重试复用 | 落盘路径由 SHA-256 决定；库内按 `batch_no` 唯一，同 sha256 直接返回既有受理（`reused_retry=true`） |
 | 异内容 / 异设备拒绝 | sha256 不同或 device 不同 → `409 Conflict` |
 | 同设备慢批不被后批越过 | worker 每设备先取 `accept_seq` 最小的 PENDING 批；设备级会话咨询锁 `pg_try_advisory_lock`（非阻塞，拿不到就跳过该设备）串行化同设备 |
+| 设备间锁永不串扰 | 锁键取自 `device_state.lock_key`（数据库生成的每设备唯一 bigint），**不是**设备号的 32 位哈希——`hashtext('DEV-29784') = hashtext('DEV-140889')` 这类碰撞会让两台无关设备共用一把锁、慢批互相拖累；已登记设备与新设备在受理事务中即获得唯一键 |
 | 高并发受理不发生连接池饥饿 | 受理序号分配**不使用阻塞式咨询锁**，而靠 `(device_id, accept_seq)` 唯一约束 + 冲突重试；每个受理事务都很短，没有连接会在等锁时被占住，因此同设备再多并发提交也不会自死锁 |
 | 不阻塞其他设备/上传/查询 | 锁是设备级而非全局；HTTP 请求与 worker 用同一连接池，互不阻塞 |
 | 实例退出后存活实例接续 | 判定在**单事务**内完成；进程崩溃则事务回滚，批次保持 PENDING、`device_state` 不变，咨询锁随会话自动释放，存活实例下轮 poll（0.25s）接续 |
@@ -44,7 +45,7 @@ scripts/
   worker_harness.py  单实例 worker 驱动（提交/慢批/崩溃标记/空闲退出）
   demo_local.py      本地双实例端到端演示（便携 Postgres）
   demo_compose.sh    Docker Compose 栈演示
-tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复（23 个）
+tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复（29 个）
 deploy/nginx/   双实例轮询负载均衡
 docker-compose.yml  db + api1 + api2 + nginx
 ```
@@ -99,15 +100,16 @@ W002,508
 ```bash
 DATABASE_DSN=<postgres dsn> python -m pytest -q
 ```
-28 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
+29 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
 隔离批不进参考窗、滚动窗口滑动、幂等重试与 409 冲突、供数不可见隔离批、
-双 worker 同设备 FIFO 与跨设备并行、小连接池下高并发同设备受理无死锁（回归）、
+双 worker 同设备 FIFO 与跨设备并行（含 `DEV-29784`/`DEV-140889` 这对 32 位
+哈希碰撞设备的回归）、小连接池下高并发同设备受理无死锁（回归）、
 真实子进程硬退出后的接续与无半批。
 
 ## 演示中的慢批/崩溃钩子（仅测试用途）
 
-* `SLOW_MARKER_FILE`：每行 `batch_id` 或 `batch_id:秒数`，命中的批在持有设备锁
-  期间睡眠，用于制造慢批；
-* 同目录 `crash_batches.txt`：每行 `batch_id`，worker 在该批提交判定前调用
+* `SLOW_MARKER_FILE`：每行 `批号:秒数` 或 `批号`（也接受数值型批次 id），命中的批在
+  持有设备锁期间睡眠，用于制造慢批；按批号书写可在提交前就位，演示无竞态；
+* 同目录 `crash_batches.txt`：每行 `批号`（或批次 id），worker 在该批提交判定前调用
   `os._exit(1)` 硬退出（等价 `kill -9`）。生产环境不挂载/不写这些文件即可，
   文件缺失时功能完全关闭。

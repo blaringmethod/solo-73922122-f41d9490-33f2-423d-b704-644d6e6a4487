@@ -11,8 +11,9 @@ Durability model
   observable intermediate ("half batch") state and the reference list can
   never be advanced twice.
 * Row-level locking (``SELECT ... FOR UPDATE`` on ``device_state`` plus a
-  transaction-scoped advisory lock on the device) serialises workers for one
-  device while different devices proceed independently.
+  session-scoped advisory lock keyed by the device's unique ``lock_key``)
+  serialises workers for one device while different devices proceed
+  independently.
 """
 
 SCHEMA_SQL = """
@@ -54,12 +55,22 @@ CREATE INDEX IF NOT EXISTS idx_wafers_batch ON wafer_measurements (batch_id);
 -- One row per device: the durable processing cursor (last accepted sequence
 -- that has been decided) and the FIFO list of released batch ids that form
 -- the rolling reference window (most recent last).
+-- lock_key is a unique, stable bigint per device used as the worker's
+-- advisory-lock key.  A database-generated id is collision-free by
+-- construction -- a 32-bit hash of the device id is NOT (e.g.
+-- hashtext('DEV-29784') = hashtext('DEV-140889'), which would make two
+-- unrelated devices share one lock and block each other).
 CREATE TABLE IF NOT EXISTS device_state (
     device_id        TEXT PRIMARY KEY,
     last_decided_seq BIGINT NOT NULL DEFAULT 0,
     ref_batch_ids    JSONB  NOT NULL DEFAULT '[]'::jsonb,
+    lock_key         BIGINT GENERATED ALWAYS AS IDENTITY,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Upgrade path for databases created before lock_key existed.
+ALTER TABLE device_state
+    ADD COLUMN IF NOT EXISTS lock_key BIGINT GENERATED ALWAYS AS IDENTITY;
 """
 
 
@@ -67,4 +78,16 @@ async def init_schema(conn) -> None:
     # BIGSERIAL spelled out so the file stays readable on its own.
     sql = SCHEMA_SQL.replace("BIGGENERATED_PLACEHOLDER",
                              "BIGINT GENERATED ALWAYS AS IDENTITY")
-    await conn.execute(sql)
+    # Serialise initialisation across the two API instances: concurrent
+    # CREATE TABLE IF NOT EXISTS / ADD COLUMN ... IDENTITY can otherwise race
+    # on the identity sequence's pg_class entry and fail startup with a
+    # spurious UniqueViolationError.  Key 0 of the worker lock namespace is
+    # never assigned to a device (identity columns start at 1), so this
+    # cannot collide with the per-device worker locks.
+    from .config import settings
+    lock_key = settings.worker_lock_id << 32
+    await conn.execute("SELECT pg_advisory_lock($1)", lock_key)
+    try:
+        await conn.execute(sql)
+    finally:
+        await conn.execute("SELECT pg_advisory_unlock($1)", lock_key)

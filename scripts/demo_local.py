@@ -134,15 +134,15 @@ class ApiInstance:
         self.log.close()
 
 
-async def _peek_pending(dsn: str, batch_id: int) -> dict:
+async def _peek_pending(dsn: str, batch_no: str) -> dict:
     import asyncpg
     conn = await asyncpg.connect(dsn)
     try:
         await conn.set_type_codec("jsonb", encoder=json.dumps,
                                   decoder=json.loads, schema="pg_catalog")
         row = await conn.fetchrow(
-            "SELECT status, median_nm, attempts FROM batches WHERE id=$1",
-            batch_id)
+            "SELECT status, median_nm, attempts FROM batches WHERE batch_no=$1",
+            batch_no)
         return dict(row)
     finally:
         await conn.close()
@@ -170,24 +170,33 @@ def main() -> int:
                        os.path.join(workdir, "api2.log"))
 
     print("\n=== DEMO 1: slow head-of-line batch ===")
-    api1.start(); api2.start()
     run = uuid.uuid4().hex[:6]
     dev_f, dev_g = f"F-{run}", f"G-{run}"
+    # Mark F1 slow BEFORE any worker runs, keyed by batch number, so the
+    # marker is guaranteed to be in place when a worker picks F1 up.
+    with open(os.path.join(raw_dir, "slow_batches.txt"), "w") as fh:
+        fh.write(f"{run}-F1:6\n")
+    print(f"  marked batch {run}-F1 as SLOW (6s), device {dev_f}")
+    api1.start(); api2.start()
     code, f1 = upload(port1, f"{run}-F1", dev_f, 500)
     assert code == 202, f1
-    f1_id = f1["batch_id"]
+    time.sleep(0.8)  # let one instance pick F1 up and start the slow sleep
+    # Uploads stay available while F1 is processing.
     upload(port2, f"{run}-F2", dev_f, 500)
     upload(port1, f"{run}-F3", dev_f, 504)
-    # Another device flows immediately despite the slow F device.
     upload(port1, f"{run}-G1", dev_g, 700)
     upload(port2, f"{run}-G2", dev_g, 700)
-    with open(os.path.join(raw_dir, "slow_batches.txt"), "w") as fh:
-        fh.write(f"{f1_id}:6\n")
-    print(f"  marked batch id={f1_id} as SLOW (6s), device {dev_f}")
-    time.sleep(1.5)
 
-    _, f1_now = http("GET", f"http://127.0.0.1:{port2}/batches/{run}-F1")
-    _, g2 = http("GET", f"http://127.0.0.1:{port1}/batches/{run}-G2")
+    # The other device must be decided (by the idle instance) while F1 is
+    # still inside its 6-second slow window.
+    g2 = {}
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        _, f1_now = http("GET", f"http://127.0.0.1:{port2}/batches/{run}-F1")
+        _, g2 = http("GET", f"http://127.0.0.1:{port1}/batches/{run}-G2")
+        if g2.get("status") == "RELEASED":
+            break
+        time.sleep(0.2)
     print(f"  while F1 is processing: F1={f1_now['status']}, "
           f"G2(other device)={g2['status']}")
     assert f1_now["status"] == "PENDING" and g2["status"] == "RELEASED"
@@ -202,45 +211,41 @@ def main() -> int:
 
     print("\n=== DEMO 2: worker crash then survivor takeover ===")
     dev_k = f"K-{run}"
-    # Stop the regular workers so we control who processes the K device.
+    # Stop both API instances so no worker can decide the K batches while
+    # they are being ingested -- the crash must hit a PENDING batch.
     api1.shutdown(); api2.shutdown()
 
-    # Restart api2 briefly just to ingest the four K batches, then stop it so
-    # nothing has decided them yet.
-    api2 = ApiInstance("api2", port2, {**common_env, "INSTANCE_ID": "api2"},
-                       os.path.join(workdir, "api2.log"))
-    api2.start()
-    code, k1_accept = upload(port2, f"{run}-K1", dev_k, 500)
-    assert code == 202, k1_accept
-    upload(port2, f"{run}-K2", dev_k, 500)
-    upload(port2, f"{run}-K3", dev_k, 500)
-    upload(port2, f"{run}-K4", dev_k, 504)
-    # Give the workers no time to process before shutting down.
-    api2.shutdown()
-    mid0 = asyncio.run(_peek_pending(dsn, k1_accept["batch_id"]))
+    # Ingest four batches with a workerless harness: afterwards every K batch
+    # is guaranteed to still be PENDING.
+    k_spec = ",".join(f"{run}-{n}:{dev_k}:{t}:5" for n, t in
+                      (("K1", 500), ("K2", 500), ("K3", 500), ("K4", 504)))
+    rc = subprocess.call(
+        [VENV_PY, "-m", "scripts.worker_harness", "--instance-id", "ingest",
+         "--no-worker", "--submit", k_spec],
+        cwd=ROOT, env={**common_env, "INSTANCE_ID": "ingest"})
+    assert rc == 0
+    mid0 = asyncio.run(_peek_pending(dsn, f"{run}-K1"))
     assert mid0["status"] == "PENDING", mid0
 
+    # Crash marker keyed by batch number (known before the batch exists).
     crash_path = os.path.join(raw_dir, "crash_batches.txt")
     with open(crash_path, "w") as fh:
-        fh.write(f"{k1_accept['batch_id']}\n")
-    print(f"  crash marker set for batch id={k1_accept['batch_id']}")
+        fh.write(f"{run}-K1\n")
+    print(f"  crash marker set for batch {run}-K1")
 
     # A dedicated one-shot worker (separate process) hard-exits via os._exit
     # while deciding K1 -- equivalent to kill -9 of an API container.
-    crasher_env = {**common_env,
-                   "SLOW_MARKER_FILE": os.path.join(raw_dir, "slow_batches.txt")}
     crasher = subprocess.Popen(
         [VENV_PY, "-m", "scripts.worker_harness",
-         "--instance-id", "crasher", "--crash",
-         str(k1_accept["batch_id"])],
-        cwd=ROOT, env=crasher_env,
+         "--instance-id", "crasher"],
+        cwd=ROOT, env=common_env,
         stdout=open(os.path.join(workdir, "crasher.log"), "ab"),
         stderr=subprocess.STDOUT)
-    rc = crasher.wait(timeout=20)
+    rc = crasher.wait(timeout=30)
     print(f"  crasher process hard-exited with code {rc} while deciding K1")
     assert rc != 0
 
-    mid = asyncio.run(_peek_pending(dsn, k1_accept["batch_id"]))
+    mid = asyncio.run(_peek_pending(dsn, f"{run}-K1"))
     print(f"  after crash: K1 row = {mid} (PENDING, no median => no half state)")
     assert mid["status"] == "PENDING" and mid["median_nm"] is None
 
